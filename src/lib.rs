@@ -27,6 +27,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
 }
 
 
+#[derive(Debug)]
 pub struct RawRwLock {
     // The state of the rwlock is composed as follows:
     //
@@ -45,6 +46,13 @@ pub struct RawRwLock {
     //    starvation, new read locks cannot be acquired if this bit is set.
     state: AtomicUsize,
 }
+impl Clone for RawRwLock {
+    fn clone(&self) -> Self {
+        Self {
+            state: AtomicUsize::new(0),
+        }
+    }
+}
 
 const RWLOCK_STATE_ACTIVE_WRITER_BIT: usize = 1 << (mem::size_of::<usize>() * 8 - 1);
 const RWLOCK_STATE_ACTIVE_INTENT_BIT: usize = 1 << (mem::size_of::<usize>() * 8 - 2);
@@ -58,7 +66,7 @@ impl RawRwLock {
     fn try_lock_exclusive_raw(&self) -> (bool, bool) {
         let prev_state = self.state.fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
         let was_previously_pending = prev_state & RWLOCK_STATE_PENDING_WRITER_BIT != 0;
-        let success = self.state.compare_exchange(prev_state | RWLOCK_STATE_PENDING_WRITER_BIT, prev_state | RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release, Ordering::Relaxed).is_ok();
+        let success = self.state.compare_exchange(RWLOCK_STATE_PENDING_WRITER_BIT, RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release, Ordering::Relaxed).is_ok();
         (success, was_previously_pending)
     }
 }
@@ -136,22 +144,37 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
     fn try_lock_upgradable(&self) -> bool {
         use lock_api::RawRwLock as _;
 
-        // begin by acquiring a read lock.
+        // Begin by acquiring a read lock.
         if !self.try_lock_shared() { return false };
 
+        // At this stage we know that it is completely impossible for a write lock to exist, since
+        // try_lock_shared() would return false in that case. Hence, all we have to do is setting
+        // the active intent bit, and returning false if it was already set.
         let prev = self.state.fetch_or(RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
-        todo!()
+        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "acquiring an intent lock while an exclusive lock was held");
+
+        prev & RWLOCK_STATE_ACTIVE_INTENT_BIT == 0
     }
     // releases an intent lock
     fn unlock_upgradable(&self) {
-        let prev = self.state.fetch_and(!RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
+        // assumes that the lock is properly managed by lock_api; if RWLOCK_STATE_ACTIVE_INTENT_BIT
+        // is not set and this method is called, the CPU will arithmetically borrow the bits below,
+        // potentially corrupting the rwlock state entirely.
+        let prev = self.state.fetch_sub(RWLOCK_STATE_ACTIVE_INTENT_BIT | 1, Ordering::Release);
+        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "releasing an intent lock while no intent lock was held");
+        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "releasing an intent lock while an exclusive lock was held");
     }
     // upgrades an intent lock into an exclusive lock
     fn upgrade(&self) {
+        while !self.try_upgrade() {
+            atomic::spin_loop_hint();
+        }
     }
 
     // tries to upgrade an intent lock into an exclusive lock
     fn try_upgrade(&self) -> bool {
+        // Since intent locks conflict with write locks, all we have do here is to flip the "intent
+        // active" and the "writer active" bits.
         let prev = self.state.fetch_xor(RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release);
 
         debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "upgrading an intent lock into an exclusive lock when no intent lock was held");
@@ -189,7 +212,7 @@ pub type ReentrantMutexGuard<'a, T, G> = lock_api::ReentrantMutexGuard<'a, RawRw
 
 #[cfg(test)]
 mod tests {
-    use super::{RwLock, Mutex};
+    use super::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex};
 
     use std::{sync::Arc, thread};
 
@@ -202,7 +225,7 @@ mod tests {
     }
 
     #[test]
-    fn multithread_mutex_loom() {
+    fn multithread_mutex() {
         let data = Arc::new(Mutex::new(2));
         let main_thread = thread::current();
 
@@ -224,9 +247,8 @@ mod tests {
     fn singlethread_rwlock() {
         let data = RwLock::new(1);
 
+        let intent_lock = data.upgradable_read();
         {
-            let intent_lock = data.upgradable_read();
-
             let lock1 = data.read();
             let lock2 = data.read();
             let lock3 = data.read();
@@ -236,5 +258,23 @@ mod tests {
             assert_eq!(*lock3, 1);
             assert_eq!(*intent_lock, 1);
         }
+        let mut write_lock = RwLockUpgradableReadGuard::upgrade(intent_lock);
+        *write_lock = 2;
+
+        let intent_lock_again = RwLockWriteGuard::downgrade_to_upgradable(write_lock);
+        let lock1 = {
+            let lock1 = data.read();
+            let lock2 = data.read();
+
+            assert_eq!(*intent_lock_again, 2);
+            assert_eq!(*lock1, 2);
+            assert_eq!(*lock2, 2);
+            lock1
+        };
+        assert!(data.try_write().is_none());
+        let lock3 = RwLockUpgradableReadGuard::downgrade(intent_lock_again);
+        assert_eq!(*lock3, 2);
+        assert_eq!(*lock1, 2);
     }
+    // TODO: multithread_rwlock
 }
