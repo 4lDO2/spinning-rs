@@ -67,9 +67,20 @@ const RWLOCK_STATE_COUNT_MASK: usize = !RWLOCK_STATE_EXTRA_MASK;
 
 impl RawRwLock {
     fn try_lock_exclusive_raw(&self) -> (bool, bool) {
-        let prev_state = self.state.fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
+        let prev_state = self.state.fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::AcqRel);
+        let current_state = prev_state | RWLOCK_STATE_PENDING_WRITER_BIT;
         let was_previously_pending = prev_state & RWLOCK_STATE_PENDING_WRITER_BIT != 0;
-        let success = self.state.compare_exchange(RWLOCK_STATE_PENDING_WRITER_BIT, RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release, Ordering::Relaxed).is_ok();
+
+        if prev_state & RWLOCK_STATE_ACTIVE_INTENT_BIT != 0 {
+            debug_assert_eq!(prev_state & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "simultaneously active INTENT and exclusive locks during exclusive lock acquisition");
+            return (false, was_previously_pending);
+        }
+        if prev_state & RWLOCK_STATE_ACTIVE_WRITER_BIT != 0 {
+            debug_assert_eq!(prev_state & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "simultaneously active intent and EXCLUSIVE locks during exclusive lock acquisition");
+            return (false, was_previously_pending);
+        }
+
+        let success = self.state.compare_exchange(current_state, (current_state + 1) | RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Acquire, Ordering::Relaxed).is_ok();
         (success, was_previously_pending)
     }
 }
@@ -153,7 +164,7 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
         // At this stage we know that it is completely impossible for a write lock to exist, since
         // try_lock_shared() would return false in that case. Hence, all we have to do is setting
         // the active intent bit, and returning false if it was already set.
-        let prev = self.state.fetch_or(RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
+        let prev = self.state.fetch_or(RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::AcqRel);
         debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "acquiring an intent lock while an exclusive lock was held");
 
         prev & RWLOCK_STATE_ACTIVE_INTENT_BIT == 0
@@ -372,6 +383,30 @@ mod tests {
         thread::park();
         assert_eq!(*data.lock(), 3);
     }
+    #[test]
+    fn multithread_rwlock() {
+        // TODO: More complex test, or maybe this is done in an integration test.
+        let data = Arc::new(RwLock::new(Vec::<u64>::new()));
+        assert_eq!(&*data.read(), &[]);
+
+        let threads = (0..4).map(|index| {
+            let data = Arc::clone(&data);
+            thread::spawn(move || {
+                let mut write_guard = data.write();
+                write_guard.push(index);
+            })
+        }).collect::<Vec<_>>();
+
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let mut write_guard = data.write();
+        write_guard.sort();
+
+        let read_guard = RwLockWriteGuard::downgrade(write_guard);
+        assert_eq!(&*read_guard, &[0, 1, 2, 3]);
+    }
 
     #[test]
     fn singlethread_rwlock() {
@@ -431,6 +466,9 @@ mod tests {
 
         let opinion_clone = Arc::clone(&opinion);
 
+        // set panic hook to avoid messing up stdout
+        std::panic::set_hook(Box::new(|_| {}));
+
         let join_handle = thread::Builder::new()
             .name(String::from("this thread should panic"))
             .spawn(move || {
@@ -471,6 +509,6 @@ mod tests {
             thread.join().unwrap();
         }
     }
-    // TODO: multithread_rwlock
+
     // TODO: loom, although it doesn't seem to support const fn initialization
 }
