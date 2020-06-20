@@ -1,8 +1,11 @@
-#![cfg_attr(not(test), no_std)]
+#![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
-use core::mem;
-use core::sync::atomic::{self, AtomicBool, AtomicUsize, Ordering};
+use core::cell::UnsafeCell;
+use core::mem::{self, MaybeUninit};
+use core::ptr;
+use core::sync::atomic::{self, AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
+/// An extremely simple spinlock, locking by compare-and-swapping a single flag and repeating.
 pub struct RawMutex {
     locked: AtomicBool,
 }
@@ -210,9 +213,124 @@ pub type MappedRwLockWriteGuard<'a, T> = lock_api::MappedRwLockWriteGuard<'a, Ra
 pub type ReentrantMutex<T, G> = lock_api::ReentrantMutex<RawRwLock, G, T>;
 pub type ReentrantMutexGuard<'a, T, G> = lock_api::ReentrantMutexGuard<'a, RawRwLock, G, T>;
 
+/// A synchronization primitive which initializes a value lazily, once. Since this also includes a
+/// value, it is a bit more like `Once` from `parking_lot` or `spin`.
+pub struct Once<T> {
+    state: AtomicU8,
+    value: UnsafeCell<MaybeUninit<T>>,
+}
+
+unsafe impl<T: Send + Sync> Send for Once<T> {}
+unsafe impl<T: Send + Sync> Sync for Once<T> {}
+
+#[repr(u8)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum OnceState {
+    Uninitialized = 0,
+    Initializing = 1,
+    Initialized = 2,
+}
+
+impl<T> Once<T> {
+    pub const fn new() -> Self {
+        Self {
+            state: AtomicU8::new(OnceState::Uninitialized as u8),
+            value: UnsafeCell::new(MaybeUninit::uninit()),
+        }
+    }
+    pub const fn uninitialized() -> Self {
+        Self::new()
+    }
+    pub const fn initialized(value: T) -> Self {
+        Self {
+            state: AtomicU8::new(OnceState::Initialized as u8),
+            value: UnsafeCell::new(MaybeUninit::new(value)),
+        }
+    }
+    pub fn initialize(&self, value: T) -> Result<(), T> {
+        match self.state.compare_exchange(OnceState::Uninitialized as u8, OnceState::Initializing as u8, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => {
+                unsafe { ptr::write(self.value.get(), MaybeUninit::new(value)) };
+                let old = self.state.swap(OnceState::Initialized as u8, Ordering::Release);
+                debug_assert_eq!(old, OnceState::Initializing as u8, "once state was modified when setting state to \"initialized\"");
+                Ok(())
+            }
+            Err(_) => Err(value),
+        }
+    }
+    pub fn try_call_once<'a, F>(&'a self, init: F) -> Result<&'a T, F>
+    where
+        F: FnOnce() -> T,
+    {
+        match self.state.compare_exchange(OnceState::Uninitialized as u8, OnceState::Initializing as u8, Ordering::AcqRel, Ordering::Relaxed) {
+            Ok(_) => unsafe {
+                ptr::write(self.value.get(), MaybeUninit::new(init()));
+                let old = self.state.swap(OnceState::Initialized as u8, Ordering::Release);
+                debug_assert_eq!(old, OnceState::Initializing as u8, "once state was modified when setting state to \"initialized\"");
+                Ok(&*(self.value.get() as *const T))
+            }
+            Err(other_state) if other_state == OnceState::Initialized as u8 => unsafe {
+                Ok(&*(self.value.get() as *const T))
+            }
+
+            #[cfg(debug_assertions)]
+            Err(other_state) if other_state == OnceState::Initializing as u8 => Err(init),
+
+            #[cfg(debug_assertions)]
+            Err(_) => unreachable!(),
+
+            #[cfg(not(debug_assertions))]
+            Err(_) => Err(init),
+        }
+    }
+    pub fn call_once<'a, F>(&'a self, mut init: F) -> &'a T
+    where
+        F: FnOnce() -> T,
+    {
+        loop {
+            match self.try_call_once(init) {
+                Ok(reference) => return reference,
+                Err(init_again) => {
+                    init = init_again;
+                    continue;
+                }
+            }
+        }
+    }
+    pub fn wait<'a>(&'a self) -> &'a T {
+        loop {
+            match self.try_get() {
+                Some(t) => return t,
+                None => continue,
+            }
+        }
+    }
+    pub fn try_get<'a>(&'a self) -> Option<&'a T> {
+        let state = self.state.load(Ordering::Acquire);
+
+        if state != OnceState::Initialized as u8 {
+            return None;
+        }
+        Some(unsafe { &*(self.value.get() as *const T) })
+    }
+    pub fn state(&self) -> OnceState {
+        match self.state.load(Ordering::Relaxed) {
+            0 => OnceState::Uninitialized,
+            1 => OnceState::Initializing,
+            2 => OnceState::Initialized,
+            _ => unreachable!(),
+        }
+    }
+}
+#[cfg(any(test, feature = "std"))]
+impl<T: std::panic::UnwindSafe> std::panic::UnwindSafe for Once<T> {}
+
+#[cfg(any(test, feature = "std"))]
+impl<T: std::panic::RefUnwindSafe> std::panic::RefUnwindSafe for Once<T> {}
+
 #[cfg(test)]
 mod tests {
-    use super::{RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex};
+    use super::{Once, OnceState, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex};
 
     use std::{sync::Arc, thread};
 
@@ -276,5 +394,44 @@ mod tests {
         assert_eq!(*lock3, 2);
         assert_eq!(*lock1, 2);
     }
+    #[test]
+    fn singlethread_once() {
+        let once = Once::<String>::uninitialized();
+        assert_eq!(once.state(), OnceState::Uninitialized);
+        assert_eq!(once.try_get(), None);
+        once.initialize(String::from("Hello, world!")).expect("once initialization failed");
+        assert_eq!(once.state(), OnceState::Initialized);
+        assert_eq!(once.try_get().map(String::as_str), Some("Hello, world!"));
+        assert_eq!(once.wait(), "Hello, world!");
+        assert!(once.initialize(String::from("Goodbye, world!")).is_err());
+    }
+    #[test]
+    fn once_preinit() {
+        let once = Once::<String>::initialized(String::from("Already initialized!"));
+        assert_eq!(once.state(), OnceState::Initialized);
+        assert_eq!(once.try_get().map(String::as_str), Some("Already initialized!"));
+        assert_eq!(once.wait(), "Already initialized!");
+    }
+    #[test]
+    fn once_with_panic_in_init() {
+        let opinion = Arc::new(Once::<String>::new());
+        let byte_str = b"Panicking is particul\xFFrly dangerous when dealing with unsafe!";
+
+        let opinion_clone = Arc::clone(&opinion);
+
+        let join_handle = thread::spawn(move || {
+            opinion_clone.call_once(|| String::from_utf8(byte_str.to_vec()).unwrap());
+        });
+
+        assert!(join_handle.join().is_err());
+        assert_eq!(opinion.try_get(), None);
+        assert_eq!(opinion.state(), OnceState::Initializing);
+    }
+
+    /* TODO
+    #[test]
+    fn multithread_once() {
+    }*/
     // TODO: multithread_rwlock
+    // TODO: loom, although it doesn't seem to support const fn initialization
 }
