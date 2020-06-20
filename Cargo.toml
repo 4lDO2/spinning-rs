@@ -1,6 +1,6 @@
 [package]
 name = "spinning"
-version = "0.1.0"
+version = "0.0.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
 description = "Mutexes and SIX locks implemented by spinning"
@@ -17,6 +17,8 @@ categories = ["concurrency", "no-std"]
 default = ["std"]
 std = []
 
+[badges]
+travis-ci = { repository = "4lDO2/spinning-rs", branch = "master" }
 
 [dependencies]
 lock_api = "0.3"
