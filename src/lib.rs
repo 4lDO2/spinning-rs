@@ -419,19 +419,46 @@ mod tests {
 
         let opinion_clone = Arc::clone(&opinion);
 
-        let join_handle = thread::spawn(move || {
-            opinion_clone.call_once(|| String::from_utf8(byte_str.to_vec()).unwrap());
-        });
+        let join_handle = thread::Builder::new()
+            .name(String::from("this thread should panic"))
+            .spawn(move || {
+                opinion_clone.call_once(|| String::from_utf8(byte_str.to_vec()).unwrap());
+            }).unwrap();
 
         assert!(join_handle.join().is_err());
         assert_eq!(opinion.try_get(), None);
         assert_eq!(opinion.state(), OnceState::Initializing);
     }
 
-    /* TODO
     #[test]
     fn multithread_once() {
-    }*/
+        let once = Arc::new(Once::new());
+        assert_eq!(once.try_get(), None);
+        assert_eq!(once.state(), OnceState::Uninitialized);
+
+        let main_thread = thread::current();
+
+        let values = ["initialized by first thread", "initialized by second thread", "initialized by third thread"];
+
+        let threads = values.iter().copied().map(|value| {
+            let once = Arc::clone(&once);
+            let main_thread = main_thread.clone();
+
+            thread::spawn(move || {
+                once.call_once(|| value);
+                main_thread.unpark();
+            })
+        }).collect::<Vec<_>>();
+
+        thread::park();
+        assert!(once.initialize("initialized by main thread").is_err());
+        assert!(once.try_get().is_some());
+        assert!(values.contains(&once.wait()));
+
+        for thread in threads {
+            thread.join().unwrap();
+        }
+    }
     // TODO: multithread_rwlock
     // TODO: loom, although it doesn't seem to support const fn initialization
 }
