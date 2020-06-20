@@ -220,6 +220,18 @@ pub struct Once<T> {
     value: UnsafeCell<MaybeUninit<T>>,
 }
 
+impl<T> Drop for Once<T> {
+    fn drop(&mut self) {
+        // we do not have to do any complex state manipulation here, since a mutable reference
+        // guarantees that only there is an exclusive borrow to this struct.
+        if *self.state.get_mut() != OnceState::Initialized as u8 {
+            // nothing to drop
+            return;
+        }
+        unsafe { ptr::drop_in_place(self.value.get() as *mut T) }
+    }
+}
+
 unsafe impl<T: Send + Sync> Send for Once<T> {}
 unsafe impl<T: Send + Sync> Sync for Once<T> {}
 
