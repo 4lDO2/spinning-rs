@@ -9,8 +9,15 @@ use core::sync::atomic::{self, AtomicBool, AtomicU8, AtomicUsize, Ordering};
 pub struct RawMutex {
     locked: AtomicBool,
 }
+
+impl RawMutex {
+    pub const fn const_new() -> Self {
+        RawMutex { locked: AtomicBool::new(false) }
+    }
+}
+
 unsafe impl lock_api::RawMutex for RawMutex {
-    const INIT: Self = RawMutex { locked: AtomicBool::new(false) };
+    const INIT: Self = RawMutex::const_new();
 
     type GuardMarker = lock_api::GuardSend;
 
@@ -66,6 +73,10 @@ const RWLOCK_STATE_EXTRA_MASK: usize = RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_S
 const RWLOCK_STATE_COUNT_MASK: usize = !RWLOCK_STATE_EXTRA_MASK;
 
 impl RawRwLock {
+    pub const fn const_new() -> Self {
+        RawRwLock { state: AtomicUsize::new(0) }
+    }
+
     fn try_lock_exclusive_raw(&self) -> (bool, bool) {
         let prev_state = self.state.fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::AcqRel);
         let current_state = prev_state | RWLOCK_STATE_PENDING_WRITER_BIT;
@@ -86,7 +97,7 @@ impl RawRwLock {
 }
 
 unsafe impl lock_api::RawRwLock for RawRwLock {
-    const INIT: Self = RawRwLock { state: AtomicUsize::new(0) };
+    const INIT: Self = RawRwLock::const_new();
 
     type GuardMarker = lock_api::GuardSend;
 
@@ -353,7 +364,7 @@ impl<T: std::panic::RefUnwindSafe> std::panic::RefUnwindSafe for Once<T> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Once, OnceState, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex};
+    use super::{Once, OnceState, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex, RawRwLock, RawMutex};
 
     use std::{sync::Arc, thread};
 
@@ -508,6 +519,12 @@ mod tests {
         for thread in threads {
             thread.join().unwrap();
         }
+    }
+
+    #[test]
+    fn const_init() {
+        static mut _RWLOCK: RwLock<usize> = RwLock::const_new(RawRwLock::const_new(), 1);
+        static mut _MUTEX : Mutex<usize> = Mutex::const_new(RawMutex::const_new(), 1);
     }
 
     // TODO: loom, although it doesn't seem to support const fn initialization
