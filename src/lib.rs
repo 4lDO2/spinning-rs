@@ -12,7 +12,9 @@ pub struct RawMutex {
 
 impl RawMutex {
     pub const fn const_new() -> Self {
-        RawMutex { locked: AtomicBool::new(false) }
+        RawMutex {
+            locked: AtomicBool::new(false),
+        }
     }
 }
 
@@ -28,14 +30,15 @@ unsafe impl lock_api::RawMutex for RawMutex {
     }
 
     fn try_lock(&self) -> bool {
-        self.locked.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed).is_ok()
+        self.locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
     }
     fn unlock(&self) {
         let prev = self.locked.fetch_and(false, Ordering::Release);
         debug_assert!(prev, "unlocking when not locked");
     }
 }
-
 
 #[derive(Debug)]
 pub struct RawRwLock {
@@ -69,16 +72,22 @@ const RWLOCK_STATE_ACTIVE_INTENT_BIT: usize = 1 << (mem::size_of::<usize>() * 8 
 
 const RWLOCK_STATE_PENDING_WRITER_BIT: usize = 1 << (mem::size_of::<usize>() * 8 - 3);
 
-const RWLOCK_STATE_EXTRA_MASK: usize = RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_PENDING_WRITER_BIT;
+const RWLOCK_STATE_EXTRA_MASK: usize = RWLOCK_STATE_ACTIVE_WRITER_BIT
+    | RWLOCK_STATE_ACTIVE_INTENT_BIT
+    | RWLOCK_STATE_PENDING_WRITER_BIT;
 const RWLOCK_STATE_COUNT_MASK: usize = !RWLOCK_STATE_EXTRA_MASK;
 
 impl RawRwLock {
     pub const fn const_new() -> Self {
-        RawRwLock { state: AtomicUsize::new(0) }
+        RawRwLock {
+            state: AtomicUsize::new(0),
+        }
     }
 
     fn try_lock_exclusive_raw(&self) -> (bool, bool) {
-        let prev_state = self.state.fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::AcqRel);
+        let prev_state = self
+            .state
+            .fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::AcqRel);
         let current_state = prev_state | RWLOCK_STATE_PENDING_WRITER_BIT;
         let was_previously_pending = prev_state & RWLOCK_STATE_PENDING_WRITER_BIT != 0;
 
@@ -91,7 +100,15 @@ impl RawRwLock {
             return (false, was_previously_pending);
         }
 
-        let success = self.state.compare_exchange(current_state, (current_state + 1) | RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Acquire, Ordering::Relaxed).is_ok();
+        let success = self
+            .state
+            .compare_exchange(
+                current_state,
+                (current_state + 1) | RWLOCK_STATE_ACTIVE_WRITER_BIT,
+                Ordering::Acquire,
+                Ordering::Relaxed,
+            )
+            .is_ok();
         (success, was_previously_pending)
     }
 }
@@ -116,7 +133,11 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
 
         if prev & RWLOCK_STATE_ACTIVE_WRITER_BIT != 0 {
             let new_prev = self.state.fetch_sub(1, Ordering::Release);
-            debug_assert_ne!(new_prev & !(RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT), 0, "overflow when subtracting rwlock counter");
+            debug_assert_ne!(
+                new_prev & !(RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT),
+                0,
+                "overflow when subtracting rwlock counter"
+            );
             return false;
         }
         true
@@ -125,13 +146,13 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
         while !self.try_lock_exclusive() {
             atomic::spin_loop_hint();
         }
-
     }
     fn try_lock_exclusive(&self) -> bool {
         let (success, was_previously_pending) = self.try_lock_exclusive_raw();
 
         if !was_previously_pending {
-            self.state.fetch_and(!RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
+            self.state
+                .fetch_and(!RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
         }
 
         success
@@ -140,22 +161,46 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     // releases a read lock
     fn unlock_shared(&self) {
         let prev = self.state.fetch_sub(1, Ordering::Release);
-        debug_assert_ne!(prev & RWLOCK_STATE_COUNT_MASK, 0, "corrupted state flags because of subtraction overflow, when release a shared lock");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "releasing a shared lock while a write lock was held");
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_COUNT_MASK,
+            0,
+            "corrupted state flags because of subtraction overflow, when release a shared lock"
+        );
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "releasing a shared lock while a write lock was held"
+        );
     }
     // releases a write lock
     fn unlock_exclusive(&self) {
-        let prev = self.state.fetch_sub(RWLOCK_STATE_ACTIVE_WRITER_BIT | 1, Ordering::Release);
+        let prev = self
+            .state
+            .fetch_sub(RWLOCK_STATE_ACTIVE_WRITER_BIT | 1, Ordering::Release);
         debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "corrupted state flags because a write lock release was tried when a write lock was not held");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "releasing a write lock when an intent lock was held");
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "releasing a write lock when an intent lock was held"
+        );
     }
 }
 unsafe impl lock_api::RawRwLockDowngrade for RawRwLock {
     // downgrades an exclusive lock to a shared lock
     fn downgrade(&self) {
-        let prev = self.state.fetch_and(!RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release);
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "downgrading a write lock to a read lock when no write lock was held");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "downgrading a write lock to a read lock when an intent lock was held");
+        let prev = self
+            .state
+            .fetch_and(!RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release);
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "downgrading a write lock to a read lock when no write lock was held"
+        );
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "downgrading a write lock to a read lock when an intent lock was held"
+        );
     }
 }
 unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
@@ -170,13 +215,21 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
         use lock_api::RawRwLock as _;
 
         // Begin by acquiring a read lock.
-        if !self.try_lock_shared() { return false };
+        if !self.try_lock_shared() {
+            return false;
+        };
 
         // At this stage we know that it is completely impossible for a write lock to exist, since
         // try_lock_shared() would return false in that case. Hence, all we have to do is setting
         // the active intent bit, and returning false if it was already set.
-        let prev = self.state.fetch_or(RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::AcqRel);
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "acquiring an intent lock while an exclusive lock was held");
+        let prev = self
+            .state
+            .fetch_or(RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::AcqRel);
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "acquiring an intent lock while an exclusive lock was held"
+        );
 
         prev & RWLOCK_STATE_ACTIVE_INTENT_BIT == 0
     }
@@ -185,9 +238,19 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
         // assumes that the lock is properly managed by lock_api; if RWLOCK_STATE_ACTIVE_INTENT_BIT
         // is not set and this method is called, the CPU will arithmetically borrow the bits below,
         // potentially corrupting the rwlock state entirely.
-        let prev = self.state.fetch_sub(RWLOCK_STATE_ACTIVE_INTENT_BIT | 1, Ordering::Release);
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "releasing an intent lock while no intent lock was held");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "releasing an intent lock while an exclusive lock was held");
+        let prev = self
+            .state
+            .fetch_sub(RWLOCK_STATE_ACTIVE_INTENT_BIT | 1, Ordering::Release);
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "releasing an intent lock while no intent lock was held"
+        );
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "releasing an intent lock while an exclusive lock was held"
+        );
     }
     // upgrades an intent lock into an exclusive lock
     fn upgrade(&self) {
@@ -200,10 +263,21 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
     fn try_upgrade(&self) -> bool {
         // Since intent locks conflict with write locks, all we have do here is to flip the "intent
         // active" and the "writer active" bits.
-        let prev = self.state.fetch_xor(RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release);
+        let prev = self.state.fetch_xor(
+            RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            Ordering::Release,
+        );
 
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "upgrading an intent lock into an exclusive lock when no intent lock was held");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "upgrading an intent lock into an exclusive lock when an exclusive lock was held");
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "upgrading an intent lock into an exclusive lock when no intent lock was held"
+        );
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "upgrading an intent lock into an exclusive lock when an exclusive lock was held"
+        );
 
         prev & RWLOCK_STATE_COUNT_MASK == 1
     }
@@ -211,15 +285,36 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
 unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
     // downgrades an exclusive lock to an intent lock
     fn downgrade_to_upgradable(&self) {
-        let prev = self.state.fetch_xor(RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "downgrading a write lock to an intent lock when no write lock was held");
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "downgrading a write lock to an intent lock when an intent lock was held");
+        let prev = self.state.fetch_xor(
+            RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            Ordering::Release,
+        );
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "downgrading a write lock to an intent lock when no write lock was held"
+        );
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "downgrading a write lock to an intent lock when an intent lock was held"
+        );
     }
     // downgrades an intent lock into a shared lock
     fn downgrade_upgradable(&self) {
-        let prev = self.state.fetch_and(!RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
-        debug_assert_eq!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "downgrading an intent lock while a write lock was held");
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_INTENT_BIT, 0, "downgrading an intent lock where no intent lock was held");
+        let prev = self
+            .state
+            .fetch_and(!RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
+        debug_assert_eq!(
+            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+            0,
+            "downgrading an intent lock while a write lock was held"
+        );
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "downgrading an intent lock where no intent lock was held"
+        );
     }
 }
 
@@ -282,11 +377,22 @@ impl<T> Once<T> {
         }
     }
     pub fn initialize(&self, value: T) -> Result<(), T> {
-        match self.state.compare_exchange(OnceState::Uninitialized as u8, OnceState::Initializing as u8, Ordering::AcqRel, Ordering::Relaxed) {
+        match self.state.compare_exchange(
+            OnceState::Uninitialized as u8,
+            OnceState::Initializing as u8,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => {
                 unsafe { ptr::write(self.value.get(), MaybeUninit::new(value)) };
-                let old = self.state.swap(OnceState::Initialized as u8, Ordering::Release);
-                debug_assert_eq!(old, OnceState::Initializing as u8, "once state was modified when setting state to \"initialized\"");
+                let old = self
+                    .state
+                    .swap(OnceState::Initialized as u8, Ordering::Release);
+                debug_assert_eq!(
+                    old,
+                    OnceState::Initializing as u8,
+                    "once state was modified when setting state to \"initialized\""
+                );
                 Ok(())
             }
             Err(_) => Err(value),
@@ -296,16 +402,27 @@ impl<T> Once<T> {
     where
         F: FnOnce() -> T,
     {
-        match self.state.compare_exchange(OnceState::Uninitialized as u8, OnceState::Initializing as u8, Ordering::AcqRel, Ordering::Relaxed) {
+        match self.state.compare_exchange(
+            OnceState::Uninitialized as u8,
+            OnceState::Initializing as u8,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        ) {
             Ok(_) => unsafe {
                 ptr::write(self.value.get(), MaybeUninit::new(init()));
-                let old = self.state.swap(OnceState::Initialized as u8, Ordering::Release);
-                debug_assert_eq!(old, OnceState::Initializing as u8, "once state was modified when setting state to \"initialized\"");
+                let old = self
+                    .state
+                    .swap(OnceState::Initialized as u8, Ordering::Release);
+                debug_assert_eq!(
+                    old,
+                    OnceState::Initializing as u8,
+                    "once state was modified when setting state to \"initialized\""
+                );
                 Ok(&*(self.value.get() as *const T))
-            }
+            },
             Err(other_state) if other_state == OnceState::Initialized as u8 => unsafe {
                 Ok(&*(self.value.get() as *const T))
-            }
+            },
 
             #[cfg(debug_assertions)]
             Err(other_state) if other_state == OnceState::Initializing as u8 => Err(init),
@@ -364,7 +481,10 @@ impl<T: std::panic::RefUnwindSafe> std::panic::RefUnwindSafe for Once<T> {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Once, OnceState, RwLock, RwLockUpgradableReadGuard, RwLockWriteGuard, Mutex, RawRwLock, RawMutex};
+    use super::{
+        Mutex, Once, OnceState, RawMutex, RawRwLock, RwLock, RwLockUpgradableReadGuard,
+        RwLockWriteGuard,
+    };
 
     use std::{sync::Arc, thread};
 
@@ -400,14 +520,15 @@ mod tests {
         let data = Arc::new(RwLock::new(Vec::<u64>::new()));
         assert_eq!(&*data.read(), &[]);
 
-        let threads = (0..4).map(|index| {
-            let data = Arc::clone(&data);
-            thread::spawn(move || {
-                let mut write_guard = data.write();
-                write_guard.push(index);
+        let threads = (0..4)
+            .map(|index| {
+                let data = Arc::clone(&data);
+                thread::spawn(move || {
+                    let mut write_guard = data.write();
+                    write_guard.push(index);
+                })
             })
-        }).collect::<Vec<_>>();
-
+            .collect::<Vec<_>>();
 
         for thread in threads {
             thread.join().unwrap();
@@ -428,7 +549,7 @@ mod tests {
             let lock1 = data.read();
             let lock2 = data.read();
             let lock3 = data.read();
-            
+
             assert_eq!(*lock1, 1);
             assert_eq!(*lock2, 1);
             assert_eq!(*lock3, 1);
@@ -457,7 +578,8 @@ mod tests {
         let once = Once::<String>::uninitialized();
         assert_eq!(once.state(), OnceState::Uninitialized);
         assert_eq!(once.try_get(), None);
-        once.initialize(String::from("Hello, world!")).expect("once initialization failed");
+        once.initialize(String::from("Hello, world!"))
+            .expect("once initialization failed");
         assert_eq!(once.state(), OnceState::Initialized);
         assert_eq!(once.try_get().map(String::as_str), Some("Hello, world!"));
         assert_eq!(once.wait(), "Hello, world!");
@@ -467,7 +589,10 @@ mod tests {
     fn once_preinit() {
         let once = Once::<String>::initialized(String::from("Already initialized!"));
         assert_eq!(once.state(), OnceState::Initialized);
-        assert_eq!(once.try_get().map(String::as_str), Some("Already initialized!"));
+        assert_eq!(
+            once.try_get().map(String::as_str),
+            Some("Already initialized!")
+        );
         assert_eq!(once.wait(), "Already initialized!");
     }
     #[test]
@@ -484,7 +609,8 @@ mod tests {
             .name(String::from("this thread should panic"))
             .spawn(move || {
                 opinion_clone.call_once(|| String::from_utf8(byte_str.to_vec()).unwrap());
-            }).unwrap();
+            })
+            .unwrap();
 
         assert!(join_handle.join().is_err());
         assert_eq!(opinion.try_get(), None);
@@ -499,17 +625,25 @@ mod tests {
 
         let main_thread = thread::current();
 
-        let values = ["initialized by first thread", "initialized by second thread", "initialized by third thread"];
+        let values = [
+            "initialized by first thread",
+            "initialized by second thread",
+            "initialized by third thread",
+        ];
 
-        let threads = values.iter().copied().map(|value| {
-            let once = Arc::clone(&once);
-            let main_thread = main_thread.clone();
+        let threads = values
+            .iter()
+            .copied()
+            .map(|value| {
+                let once = Arc::clone(&once);
+                let main_thread = main_thread.clone();
 
-            thread::spawn(move || {
-                once.call_once(|| value);
-                main_thread.unpark();
+                thread::spawn(move || {
+                    once.call_once(|| value);
+                    main_thread.unpark();
+                })
             })
-        }).collect::<Vec<_>>();
+            .collect::<Vec<_>>();
 
         thread::park();
         assert!(once.initialize("initialized by main thread").is_err());
@@ -524,7 +658,7 @@ mod tests {
     #[test]
     fn const_init() {
         static mut _RWLOCK: RwLock<usize> = RwLock::const_new(RawRwLock::const_new(), 1);
-        static mut _MUTEX : Mutex<usize> = Mutex::const_new(RawMutex::const_new(), 1);
+        static mut _MUTEX: Mutex<usize> = Mutex::const_new(RawMutex::const_new(), 1);
     }
 
     // TODO: loom, although it doesn't seem to support const fn initialization
