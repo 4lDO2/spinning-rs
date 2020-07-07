@@ -49,14 +49,14 @@ pub struct RawRwLock {
     //    for this is to allow for more simple atomic operations, since x86 has no instrucion doing
     //    both bit tests and addition.
     // 2. RWLOCK_STATE_ACTIVE_WRITER_BIT indicates that the lock currently holds a writer. When
-    //    acquiring a shared read lock, the counter may be incremented arbitrarily, but acquiring a
-    //    read lock must always fail when this bit is set.
+    //    acquiring a shared lock, the counter may be incremented arbitrarily, but acquiring a
+    //    shared lock must always fail when this bit is set.
     // 3. RWLOCK_STATE_ACTIVE_INTENT_BIT denotes that the rwlock currently holds an intent lock.
-    //    Attaining a read lock does ignores this bit, since intent locks only conflict with write
+    //    Attaining a shared lock does ignores this bit, since intent locks only conflict with write
     //    locks, until they are upgraded to write locks.
     // 4. RWLOCK_STATE_PENDING_WRITER_BIT can be set at any time by a failed attempt at obtaining a
-    //    write lock, due to read locks already being present. In order to prevent write lock
-    //    starvation, new read locks cannot be acquired if this bit is set.
+    //    write lock, due to shared locks already being present. In order to prevent write lock
+    //    starvation, new shared locks cannot be acquired if this bit is set.
     state: AtomicUsize,
 }
 impl Clone for RawRwLock {
@@ -105,11 +105,49 @@ impl RawRwLock {
             .compare_exchange(
                 current_state,
                 (current_state + 1) | RWLOCK_STATE_ACTIVE_WRITER_BIT,
+                // make sure that the lock is updated to be an exclusive lock, before any
+                // subsequent operations assume that underlying data to be readable (success
+                // ordering).
                 Ordering::Acquire,
+                //
                 Ordering::Relaxed,
             )
             .is_ok();
         (success, was_previously_pending)
+    }
+    unsafe fn try_upgrade_raw(&self) -> (bool, bool) {
+        let prev = self
+            .state
+            .fetch_or(RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Relaxed);
+
+        debug_assert_ne!(
+            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            0,
+            "upgrading an intent lock into an exclusive lock when no intent lock was held"
+        );
+
+        let was_previously_pending = prev & RWLOCK_STATE_PENDING_WRITER_BIT != 0;
+
+        let prev = self.state.compare_exchange_weak(
+            RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_PENDING_WRITER_BIT | 1,
+            RWLOCK_STATE_ACTIVE_WRITER_BIT | 1,
+            // make sure that the no operations that rely on the lock being an exclusive lock,
+            // happen *after* the lock has been marked exclusive (success ordering).
+            Ordering::Acquire,
+            // no synchronization needs to happen, since a lock is neither obtained nor released
+            // (failure ordering).
+            Ordering::Relaxed,
+        );
+
+        if let Ok(prev_raw) = prev {
+            debug_assert_eq!(
+                prev_raw & RWLOCK_STATE_ACTIVE_WRITER_BIT,
+                0,
+                "upgrading an intent lock into an exclusive lock when an exclusive lock was held"
+            );
+        }
+
+        (prev.is_ok(), was_previously_pending)
     }
 }
 
@@ -150,7 +188,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     fn try_lock_exclusive(&self) -> bool {
         let (success, was_previously_pending) = self.try_lock_exclusive_raw();
 
-        if !was_previously_pending {
+        if success && !was_previously_pending {
             self.state
                 .fetch_and(!RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
         }
@@ -158,7 +196,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
         success
     }
 
-    // releases a read lock
+    // releases a shared lock
     unsafe fn unlock_shared(&self) {
         let prev = self.state.fetch_sub(1, Ordering::Release);
         debug_assert_ne!(
@@ -169,19 +207,19 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
             0,
-            "releasing a shared lock while a write lock was held"
+            "releasing a shared lock while an exclusive lock was held"
         );
     }
-    // releases a write lock
+    // releases an exclusive lock
     unsafe fn unlock_exclusive(&self) {
         let prev = self
             .state
             .fetch_sub(RWLOCK_STATE_ACTIVE_WRITER_BIT | 1, Ordering::Release);
-        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "corrupted state flags because a write lock release was tried when a write lock was not held");
+        debug_assert_ne!(prev & RWLOCK_STATE_ACTIVE_WRITER_BIT, 0, "corrupted state flags because an exclusive lock release was tried when an exclusive lock was not held");
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
             0,
-            "releasing a write lock when an intent lock was held"
+            "releasing an exclusive lock when an intent lock was held"
         );
     }
 }
@@ -194,12 +232,12 @@ unsafe impl lock_api::RawRwLockDowngrade for RawRwLock {
         debug_assert_ne!(
             prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
             0,
-            "downgrading a write lock to a read lock when no write lock was held"
+            "downgrading an exclusive lock to a shared lock when no exclusive lock was held"
         );
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
             0,
-            "downgrading a write lock to a read lock when an intent lock was held"
+            "downgrading a exclusive lock to a shared lock when an intent lock was held"
         );
     }
 }
@@ -214,12 +252,12 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
     fn try_lock_upgradable(&self) -> bool {
         use lock_api::RawRwLock as _;
 
-        // Begin by acquiring a read lock.
+        // Begin by acquiring a shared lock.
         if !self.try_lock_shared() {
             return false;
         };
 
-        // At this stage we know that it is completely impossible for a write lock to exist, since
+        // At this stage we know that it is completely impossible for a exclusive lock to exist, since
         // try_lock_shared() would return false in that case. Hence, all we have to do is setting
         // the active intent bit, and returning false if it was already set.
         let prev = self
@@ -261,25 +299,14 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
 
     // tries to upgrade an intent lock into an exclusive lock
     unsafe fn try_upgrade(&self) -> bool {
-        // Since intent locks conflict with write locks, all we have do here is to flip the "intent
-        // active" and the "writer active" bits.
-        let prev = self.state.fetch_xor(
-            RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_ACTIVE_WRITER_BIT,
-            Ordering::Release,
-        );
+        let (success, was_previously_pending) = self.try_upgrade_raw();
 
-        debug_assert_ne!(
-            prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
-            0,
-            "upgrading an intent lock into an exclusive lock when no intent lock was held"
-        );
-        debug_assert_eq!(
-            prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
-            0,
-            "upgrading an intent lock into an exclusive lock when an exclusive lock was held"
-        );
+        if success && !was_previously_pending {
+            self.state
+                .fetch_and(!RWLOCK_STATE_PENDING_WRITER_BIT, Ordering::Release);
+        }
 
-        prev & RWLOCK_STATE_COUNT_MASK == 1
+        success
     }
 }
 unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
@@ -292,12 +319,12 @@ unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
         debug_assert_ne!(
             prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
             0,
-            "downgrading a write lock to an intent lock when no write lock was held"
+            "downgrading a exclusive lock to an intent lock when no exclusive lock was held"
         );
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
             0,
-            "downgrading a write lock to an intent lock when an intent lock was held"
+            "downgrading a exclusive lock to an intent lock when an intent lock was held"
         );
     }
     // downgrades an intent lock into a shared lock
@@ -308,7 +335,7 @@ unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
             0,
-            "downgrading an intent lock while a write lock was held"
+            "downgrading an intent lock while a exclusive lock was held"
         );
         debug_assert_ne!(
             prev & RWLOCK_STATE_ACTIVE_INTENT_BIT,
@@ -573,6 +600,34 @@ mod tests {
         assert_eq!(*lock3, 2);
         assert_eq!(*lock1, 2);
     }
+
+    #[test]
+    fn intent_upgrade() {
+        let data = RwLock::new(7);
+
+        let upgradable = {
+            let lock1 = data.try_read().unwrap();
+            let lock2 = data.try_read().unwrap();
+            let lock3 = data.try_read().unwrap();
+
+            let upgradable = data.try_upgradable_read().unwrap();
+            let upgrade_result = RwLockUpgradableReadGuard::try_upgrade(upgradable);
+            assert!(
+                upgrade_result.is_err(),
+                "upgraded intent lock into exclusive lock while there were still readers"
+            );
+
+            assert_eq!(*lock1, 7);
+            assert_eq!(*lock2, 7);
+            assert_eq!(*lock3, 7);
+
+            upgrade_result.err().unwrap()
+        };
+        let mut write_lock = RwLockUpgradableReadGuard::try_upgrade(upgradable).unwrap();
+        *write_lock = 8;
+        assert_eq!(*write_lock, 8);
+    }
+
     #[test]
     fn singlethread_once() {
         let once = Once::<String>::uninitialized();
