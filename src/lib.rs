@@ -34,7 +34,7 @@ unsafe impl lock_api::RawMutex for RawMutex {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
-    fn unlock(&self) {
+    unsafe fn unlock(&self) {
         let prev = self.locked.fetch_and(false, Ordering::Release);
         debug_assert!(prev, "unlocking when not locked");
     }
@@ -159,7 +159,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
     }
 
     // releases a read lock
-    fn unlock_shared(&self) {
+    unsafe fn unlock_shared(&self) {
         let prev = self.state.fetch_sub(1, Ordering::Release);
         debug_assert_ne!(
             prev & RWLOCK_STATE_COUNT_MASK,
@@ -173,7 +173,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
         );
     }
     // releases a write lock
-    fn unlock_exclusive(&self) {
+    unsafe fn unlock_exclusive(&self) {
         let prev = self
             .state
             .fetch_sub(RWLOCK_STATE_ACTIVE_WRITER_BIT | 1, Ordering::Release);
@@ -187,7 +187,7 @@ unsafe impl lock_api::RawRwLock for RawRwLock {
 }
 unsafe impl lock_api::RawRwLockDowngrade for RawRwLock {
     // downgrades an exclusive lock to a shared lock
-    fn downgrade(&self) {
+    unsafe fn downgrade(&self) {
         let prev = self
             .state
             .fetch_and(!RWLOCK_STATE_ACTIVE_WRITER_BIT, Ordering::Release);
@@ -234,7 +234,7 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
         prev & RWLOCK_STATE_ACTIVE_INTENT_BIT == 0
     }
     // releases an intent lock
-    fn unlock_upgradable(&self) {
+    unsafe fn unlock_upgradable(&self) {
         // assumes that the lock is properly managed by lock_api; if RWLOCK_STATE_ACTIVE_INTENT_BIT
         // is not set and this method is called, the CPU will arithmetically borrow the bits below,
         // potentially corrupting the rwlock state entirely.
@@ -253,14 +253,14 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
         );
     }
     // upgrades an intent lock into an exclusive lock
-    fn upgrade(&self) {
+    unsafe fn upgrade(&self) {
         while !self.try_upgrade() {
             atomic::spin_loop_hint();
         }
     }
 
     // tries to upgrade an intent lock into an exclusive lock
-    fn try_upgrade(&self) -> bool {
+    unsafe fn try_upgrade(&self) -> bool {
         // Since intent locks conflict with write locks, all we have do here is to flip the "intent
         // active" and the "writer active" bits.
         let prev = self.state.fetch_xor(
@@ -284,7 +284,7 @@ unsafe impl lock_api::RawRwLockUpgrade for RawRwLock {
 }
 unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
     // downgrades an exclusive lock to an intent lock
-    fn downgrade_to_upgradable(&self) {
+    unsafe fn downgrade_to_upgradable(&self) {
         let prev = self.state.fetch_xor(
             RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT,
             Ordering::Release,
@@ -301,7 +301,7 @@ unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
         );
     }
     // downgrades an intent lock into a shared lock
-    fn downgrade_upgradable(&self) {
+    unsafe fn downgrade_upgradable(&self) {
         let prev = self
             .state
             .fetch_and(!RWLOCK_STATE_ACTIVE_INTENT_BIT, Ordering::Release);
