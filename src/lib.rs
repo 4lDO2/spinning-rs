@@ -109,7 +109,6 @@ impl RawRwLock {
                 // subsequent operations assume that underlying data to be readable (success
                 // ordering).
                 Ordering::Acquire,
-
                 // a failed attempt to attain an exclusive lock means that the lock cannot later be
                 // used for data accesses, and thus no synchronization is needed here (failure
                 // ordering).
@@ -317,7 +316,6 @@ unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
     unsafe fn downgrade_to_upgradable(&self) {
         let prev = self.state.fetch_xor(
             RWLOCK_STATE_ACTIVE_WRITER_BIT | RWLOCK_STATE_ACTIVE_INTENT_BIT,
-
             // ensure that previous memory accesses, which may have been writes (as we are
             // downgrading an exclusive lock), happen before other threads see this downgrade.
             Ordering::Release,
@@ -335,17 +333,14 @@ unsafe impl lock_api::RawRwLockUpgradeDowngrade for RawRwLock {
     }
     // downgrades an intent lock into a shared lock
     unsafe fn downgrade_upgradable(&self) {
-        let prev = self
-            .state
-            .fetch_and(
-                !RWLOCK_STATE_ACTIVE_INTENT_BIT,
-
-                // this ordering is correct, because no memory accesses that may have happened
-                // before, or are going to happen afterwards, will have different rules regarding
-                // mutability (intent locks are only shared locks but with the exception that there
-                // can only be one intent lock at a time).
-                Ordering::Relaxed,
-            );
+        let prev = self.state.fetch_and(
+            !RWLOCK_STATE_ACTIVE_INTENT_BIT,
+            // this ordering is correct, because no memory accesses that may have happened
+            // before, or are going to happen afterwards, will have different rules regarding
+            // mutability (intent locks are only shared locks but with the exception that there
+            // can only be one intent lock at a time).
+            Ordering::Relaxed,
+        );
         debug_assert_eq!(
             prev & RWLOCK_STATE_ACTIVE_WRITER_BIT,
             0,
@@ -421,11 +416,9 @@ impl<T> Once<T> {
         match self.state.compare_exchange(
             OnceState::Uninitialized as u8,
             OnceState::Initializing as u8,
-
             // make sure that the actual pointer store must happen after other threads have seen
             // the updated state (success ordering).
             Ordering::Acquire,
-
             // if the once was not uninitialized, there will not be any additional stores, and
             // since we just return upon failure, Relaxed suffices here.
             Ordering::Relaxed,
