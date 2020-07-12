@@ -21,7 +21,7 @@ impl RawMutex {
 unsafe impl lock_api::RawMutex for RawMutex {
     const INIT: Self = RawMutex::const_new();
 
-    type GuardMarker = lock_api::GuardSend;
+    type GuardMarker = lock_api::GuardNoSend;
 
     fn lock(&self) {
         while !self.try_lock() {
@@ -156,7 +156,7 @@ impl RawRwLock {
 unsafe impl lock_api::RawRwLock for RawRwLock {
     const INIT: Self = RawRwLock::const_new();
 
-    type GuardMarker = lock_api::GuardSend;
+    type GuardMarker = lock_api::GuardNoSend;
 
     fn lock_shared(&self) {
         while !self.try_lock_shared() {
