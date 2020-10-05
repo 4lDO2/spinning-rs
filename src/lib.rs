@@ -1,7 +1,9 @@
 #![cfg_attr(all(not(test), not(feature = "std")), no_std)]
 
-use core::cell::UnsafeCell;
+use core::cell::{Cell, UnsafeCell};
+use core::fmt;
 use core::mem::{self, MaybeUninit};
+use core::ops::Deref;
 use core::ptr;
 use core::sync::atomic::{self, AtomicBool, AtomicU8, AtomicUsize, Ordering};
 
@@ -368,6 +370,7 @@ pub type ReentrantMutexGuard<'a, T, G> = lock_api::ReentrantMutexGuard<'a, RawRw
 
 /// A synchronization primitive which initializes a value lazily, once. Since this also includes a
 /// value, it is a bit more like `Once` from `parking_lot` or `spin`.
+#[derive(Debug)]
 pub struct Once<T> {
     state: AtomicU8,
     value: UnsafeCell<MaybeUninit<T>>,
@@ -518,6 +521,114 @@ impl<T: std::panic::UnwindSafe> std::panic::UnwindSafe for Once<T> {}
 
 #[cfg(any(test, feature = "std"))]
 impl<T: std::panic::RefUnwindSafe> std::panic::RefUnwindSafe for Once<T> {}
+
+/// A value which is initialized on the first access.
+///
+/// This type is thread-safe and can be used in statics.
+///
+/// # Example
+///
+/// ```
+/// use std::collections::HashMap;
+///
+/// use spinning::Lazy;
+///
+/// static HASHMAP: Lazy<HashMap<i32, String>> = Lazy::new(|| {
+///     println!("initializing");
+///     let mut m = HashMap::new();
+///     m.insert(13, "Spica".to_string());
+///     m.insert(74, "Hoyten".to_string());
+///     m
+/// });
+///
+/// fn main() {
+///     println!("ready");
+///     std::thread::spawn(|| {
+///         println!("{:?}", HASHMAP.get(&13));
+///     }).join().unwrap();
+///     println!("{:?}", HASHMAP.get(&74));
+///
+///     // Prints:
+///     //   ready
+///     //   initializing
+///     //   Some("Spica")
+///     //   Some("Hoyten")
+/// }
+/// ```
+pub struct Lazy<T, F = fn() -> T> {
+    once: Once<T>,
+    init: Cell<Option<F>>,
+}
+
+impl<T: fmt::Debug, F> fmt::Debug for Lazy<T, F> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        f.debug_struct("Lazy")
+            .field("once", &self.once)
+            .field("init", &"..")
+            .finish()
+    }
+}
+
+// We never create a `&F` from a `&Lazy<T, F>` so it is fine
+// to not impl `Sync` for `F`
+// we do create a `&mut Option<F>` in `force`, but this is
+// properly synchronized, so it only happens once
+// so it also does not contribute to this impl.
+unsafe impl<T, F: Send> Sync for Lazy<T, F> where Once<T>: Sync {}
+// auto-derived `Send` impl is OK.
+
+#[cfg(any(test, feature = "std"))]
+impl<T, F: std::panic::RefUnwindSafe> std::panic::RefUnwindSafe for Lazy<T, F> where
+    Once<T>: std::panic::RefUnwindSafe
+{
+}
+
+impl<T, F> Lazy<T, F> {
+    /// Creates a new lazy value with the given initializing
+    /// function.
+    pub const fn new(f: F) -> Lazy<T, F> {
+        Lazy {
+            once: Once::new(),
+            init: Cell::new(Some(f)),
+        }
+    }
+}
+
+impl<T, F: FnOnce() -> T> Lazy<T, F> {
+    /// Forces the evaluation of this lazy value and
+    /// returns a reference to the result. This is equivalent
+    /// to the `Deref` impl, but is explicit.
+    ///
+    /// # Example
+    /// ```
+    /// use spinning::Lazy;
+    ///
+    /// let lazy = Lazy::new(|| 92);
+    ///
+    /// assert_eq!(Lazy::force(&lazy), &92);
+    /// assert_eq!(&*lazy, &92);
+    /// ```
+    pub fn force(this: &Lazy<T, F>) -> &T {
+        this.once.call_once(|| match this.init.take() {
+            Some(f) => f(),
+            None => panic!("Lazy instance has previously been poisoned"),
+        })
+    }
+}
+
+impl<T, F: FnOnce() -> T> Deref for Lazy<T, F> {
+    type Target = T;
+    fn deref(&self) -> &T {
+        Lazy::force(self)
+    }
+}
+
+impl<T: Default> Default for Lazy<T> {
+    /// Creates a new lazy value using `Default` as the initializing function.
+    fn default() -> Lazy<T> {
+        Lazy::new(T::default)
+    }
+}
 
 #[cfg(test)]
 mod tests {
