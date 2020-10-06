@@ -424,7 +424,9 @@ impl<T> Once<T> {
             Ordering::Relaxed,
         ) {
             Ok(_) => {
-                unsafe { ptr::write(self.value.get(), MaybeUninit::new(value)) };
+                unsafe {
+                    (*self.value.get()).as_mut_ptr().write(value);
+                };
                 let old = self
                     .state
                     .swap(OnceState::Initialized as u8, Ordering::Release);
@@ -449,7 +451,7 @@ impl<T> Once<T> {
             Ordering::Relaxed,
         ) {
             Ok(_) => unsafe {
-                ptr::write(self.value.get(), MaybeUninit::new(init()));
+                (*self.value.get()).as_mut_ptr().write(init());
                 let old = self
                     .state
                     .swap(OnceState::Initialized as u8, Ordering::Release);
@@ -458,10 +460,10 @@ impl<T> Once<T> {
                     OnceState::Initializing as u8,
                     "once state was modified when setting state to \"initialized\""
                 );
-                Ok(&*(self.value.get() as *const T))
+                Ok(&*((*self.value.get()).as_ptr()))
             },
             Err(other_state) if other_state == OnceState::Initialized as u8 => unsafe {
-                Ok(&*(self.value.get() as *const T))
+                Ok(&*((*self.value.get()).as_ptr()))
             },
 
             #[cfg(debug_assertions)]
