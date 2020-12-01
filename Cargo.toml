@@ -1,6 +1,6 @@
 [package]
 name = "spinning"
-version = "0.0.3"
+version = "0.1.0"
 authors = ["4lDO2 <4lDO2@protonmail.com>"]
 edition = "2018"
 description = "Mutexes and SIX locks implemented by spinning"
