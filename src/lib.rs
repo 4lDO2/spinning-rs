@@ -422,8 +422,8 @@ impl<T> Once<T> {
             // make sure that the actual pointer store must happen after other threads have seen
             // the updated state (success ordering).
             Ordering::Acquire,
-            // if the once was not uninitialized, there will not be any additional stores, and
-            // since we just return upon failure, Relaxed suffices here.
+            // In the Err(_) case, i.e. it was Initialized or Initializing, the code below will
+            // never read the protected value, so Relaxed is sufficient.
             Ordering::Relaxed,
         ) {
             Ok(_) => {
@@ -450,8 +450,12 @@ impl<T> Once<T> {
         match self.state.compare_exchange(
             OnceState::Uninitialized as u8,
             OnceState::Initializing as u8,
+            // Acquire is necessary for nonatomic stores to `self.value.get()`, made visible when
+            // Release-setting `self.state` to `OnceState::Initialized`, to become visible for any
+            // further nonatomic loads after this load of `self.state` (where the value is
+            // considered initialized and thenceforth immutable).
             Ordering::Acquire,
-            Ordering::Relaxed,
+            Ordering::Acquire,
         ) {
             Ok(_) => unsafe {
                 (*self.value.get()).as_mut_ptr().write(init());
