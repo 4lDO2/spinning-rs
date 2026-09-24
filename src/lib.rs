@@ -132,7 +132,7 @@ impl RawRwLock {
 
         let was_previously_pending = prev & RWLOCK_STATE_PENDING_WRITER_BIT != 0;
 
-        let prev = self.state.compare_exchange_weak(
+        let prev = self.state.compare_exchange(
             RWLOCK_STATE_ACTIVE_INTENT_BIT | RWLOCK_STATE_PENDING_WRITER_BIT | 1,
             RWLOCK_STATE_ACTIVE_WRITER_BIT | 1,
             // make sure that the no operations that rely on the lock being an exclusive lock,
